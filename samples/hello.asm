@@ -1,19 +1,19 @@
 ; in 'hello.asm'
 	
-	global _start
+		global _start
      
-	section .text
+		section .text
 
 _start: mov rdi, 1
-	mov rsi, msg
-	mov rdx, 9
-	mov rax, 1
-	syscall
+		mov rsi, msg
+		mov rdx, 9
+		mov rax, 1
+		syscall
 
-	xor rdi, rdi
-	mov rax, 60
-	syscall
+		xor rdi, rdi
+		mov rax, 60
+		syscall
 
-	section .data
+		section .data
 
 msg:	db "hi there", 10

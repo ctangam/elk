@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 delf = { version = "0.1.0", path = "../delf" }
+mmap = "0.1.1"
+region = "3.0.2"
