@@ -1,7 +1,7 @@
-use std::{env, error::Error, fs};
+use std::{env, error::Error, fs, mem::transmute, ptr::copy_nonoverlapping};
 
 use mmap::{MapOption, MemoryMap};
-use region::Protection;
+use region::{protect, Protection};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let input_path = env::args().nth(1).expect("usage: elk FILE");
@@ -15,34 +15,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     println!("{:#?}", file);
 
-    // println!("Disassembling {:?}...", input_path);
-    // let code_ph = file
-    //     .program_headers
-    //     .iter()
-    //     .find(|ph| ph.mem_range().contains(&file.entry_point))
-    //     .expect("segment with entry point not found");
-
-    // ndisasm(&code_ph.data[..], file.entry_point)?;
-
+    let rela_entries = file.read_rela_entries()?;
     let base = 0x400000_usize;
 
-    println!("Mapping {:?} in memory...", input_path);
-
-    // we'll need to hold onto our "mmap::MemoryMap", because dropping them
-    // unmaps them!
-    let mut mappings = Vec::new();
-
-    // we're only interested in "Load" segments
-    for ph in file
+    println!("Loading with base address @ 0x{:x}", base);
+    let non_empty_load_segments = file
         .program_headers
         .iter()
         .filter(|ph| ph.r#type == delf::SegmentType::Load)
-        .filter(|ph| ph.mem_range().end > ph.mem_range().start)
+        // ignore zero-length segments
+        .filter(|ph| ph.mem_range().end > ph.mem_range().start);
 
-    {
-        println!("Mapping segment @ {:?} with {:?}", ph.mem_range(), ph.flags);
-        // note: mmap-ing would fail if the segments weren't aligned on pages,
-        // but luckily, that is the case in the file already. That is not a coincidence.
+    let mut mappings = Vec::new();
+    for ph in non_empty_load_segments {
+        println!("Mapping {:?} - {:?}", ph.mem_range(), ph.flags);
         let mem_range = ph.mem_range();
         let len: usize = (mem_range.end - mem_range.start).into();
 
@@ -50,24 +36,46 @@ fn main() -> Result<(), Box<dyn Error>> {
         let aligned_start: usize = align_lo(start);
         let padding = start - aligned_start;
         let len = len + padding;
-        // `as` is the "cast" operator, and `_` is a placeholder to force rustc
-        // to infer the type based on other hints (here, the left-hand-side declaration)
-        let addr: *mut u8 = aligned_start as _;
-        println!("Addr: {:p}, Padding: {:08x}", addr, padding);
-        // at first, we want the memory area to be writable, so we can copy to it.
-        // we'll set the right permissions later
-        let map = MemoryMap::new(len, &[MapOption::MapWritable, MapOption::MapAddr(addr)])?;
 
-        println!("Copying segment data...");
-        {
-            let dst = unsafe { std::slice::from_raw_parts_mut(addr, ph.data.len()) };
-            dst.copy_from_slice(&ph.data[..]);
+        let addr: *mut u8 = unsafe { transmute(aligned_start) };
+        if padding > 0 {
+            println!("(With 0x{:x} bytes of padding at the start)", padding);
         }
 
-        println!("Adjusting permissions...");
-        // the `region` crate and our `delf` crate have two different
-        // enums (and bit flags) for protection, so we need to map from
-        // delf's to region's.
+        let map = MemoryMap::new(len, &[MapOption::MapWritable, MapOption::MapAddr(addr)])?;
+
+        unsafe {
+            copy_nonoverlapping(ph.data.as_ptr(), addr.add(padding), len);
+        }
+
+        let mut num_relocs = 0;
+        for reloc in &rela_entries {
+            if mem_range.contains(&reloc.offset) {
+                num_relocs += 1;
+                unsafe {
+                    let real_segment_start = addr.add(padding);
+                    let offset_into_segment = reloc.offset - mem_range.start;
+                    let reloc_addr = real_segment_start.add(offset_into_segment.into());
+
+                    match reloc.r#type {
+                        delf::RelType::Relative => {
+                            // this assumes `reloc_addr` is 8-byte aligned. if this isn't
+                            // the case, we would crash, and so would the target executable.
+                            let reloc_addr: *mut u64 = transmute(reloc_addr);
+                            let reloc_value = reloc.addend + delf::Addr(base as u64);
+                            std::ptr::write_unaligned(reloc_addr, reloc_value.0);
+                        }
+                        r#type => {
+                            panic!("Unsupported relocation type {:?}", r#type);
+                        }
+                    }
+                }
+            }
+        }
+        if num_relocs > 0 {
+            println!("(Applied {} relocations)", num_relocs);
+        }
+
         let mut protection = Protection::NONE;
         for flag in ph.flags.iter() {
             protection |= match flag {
@@ -77,19 +85,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         unsafe {
-            region::protect(addr, len, protection)?;
+            protect(addr, len, protection)?;
         }
         mappings.push(map);
     }
 
     println!("Jumping to entry point @ {:?}...", file.entry_point);
-    pause("jmp")?;
     unsafe {
-        // note that we don't have to do pointer arithmetic here,
-        // as the entry point is indeed mapped in memory at the right place.
-        jmp((file.entry_point.0 as usize + base) as _);
+        jmp(transmute(file.entry_point.0 as usize + base));
     }
-    
+
     Ok(())
 }
 
