@@ -1,3 +1,4 @@
+use core::str;
 use std::{env, error::Error, fs, mem::transmute, ptr::copy_nonoverlapping};
 
 use mmap::{MapOption, MemoryMap};
@@ -15,7 +16,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     println!("{:#?}", file);
 
-    let rela_entries = file.read_rela_entries()?;
+    let rela_entries = file.read_rela_entries().unwrap_or_else(|e| {
+        println!("Could not read relocations: {:?}", e);
+        Default::default()
+    });
     let base = 0x400000_usize;
 
     println!("Loading with base address @ 0x{:x}", base);
@@ -43,7 +47,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         let map = MemoryMap::new(len, &[MapOption::MapWritable, MapOption::MapAddr(addr)])?;
-
         unsafe {
             copy_nonoverlapping(ph.data.as_ptr(), addr.add(padding), len);
         }
