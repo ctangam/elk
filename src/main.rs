@@ -20,6 +20,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Could not read relocations: {:?}", e);
         Default::default()
     });
+    println!("Found {} rela entries", rela_entries.len());
+    for entry in rela_entries.iter() {
+        println!("{:?}", entry);
+    }
+
+    if let Some(dynseg) = file.segment_of_type(delf::SegmentType::Dynamic) {
+        if let delf::SegmentContents::Dynamic(ref dyntab) = dynseg.contents {
+            println!("Dynamic table entries:");
+            for e in dyntab {
+                println!("{:?}", e);
+                match e.tag {
+                    delf::DynamicTag::Needed | delf::DynamicTag::RPath => {
+                        println!(" => {:?}", file.get_string(e.addr)?);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     let base = 0x400000_usize;
 
     println!("Loading with base address @ 0x{:x}", base);
@@ -54,23 +74,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut num_relocs = 0;
         for reloc in &rela_entries {
             if mem_range.contains(&reloc.offset) {
-                num_relocs += 1;
                 unsafe {
                     let real_segment_start = addr.add(padding);
                     let offset_into_segment = reloc.offset - mem_range.start;
                     let reloc_addr = real_segment_start.add(offset_into_segment.into());
 
                     match reloc.r#type {
-                        delf::RelType::Relative => {
-                            // this assumes `reloc_addr` is 8-byte aligned. if this isn't
-                            // the case, we would crash, and so would the target executable.
-                            let reloc_addr: *mut u64 = transmute(reloc_addr);
-                            let reloc_value = reloc.addend + delf::Addr(base as u64);
-                            std::ptr::write_unaligned(reloc_addr, reloc_value.0);
+                        delf::RelType::Known(t) => {
+                            num_relocs += 1;
+                            match t {
+                                delf::KnownRelType::Relative => {
+                                    // this assumes `reloc_addr` is 8-byte aligned. if this isn't
+                                    // the case, we would crash, and so would the target executable.
+                                    let reloc_addr: *mut u64 = transmute(reloc_addr);
+                                    let reloc_value = reloc.addend + delf::Addr(base as u64);
+                                    std::ptr::write_unaligned(reloc_addr, reloc_value.0);
+                                }
+                                t => {
+                                    panic!("Unsupported relocation type {:?}", t);
+                                }
+                            }
                         }
-                        r#type => {
-                            panic!("Unsupported relocation type {:?}", r#type);
-                        }
+                        delf::RelType::Unknown(_) => {}
                     }
                 }
             }
