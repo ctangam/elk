@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+custom_debug_derive = "0.6.2"
 delf = { version = "0.1.0", path = "../delf" }
 mmap = "0.1.1"
 region = "3.0.2"
+thiserror = "2.0.6"
