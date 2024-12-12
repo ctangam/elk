@@ -20,6 +20,20 @@ pub enum LoadError {
     NoLoadSegments,
     #[error("ELF object could not be mapped in memory: {0}")]
     MapError(#[from] mmap::MapError),
+    #[error("Could not read symbols from ELF object: {0}")]
+    ReadSymsError(#[from] delf::ReadSymsError),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RelocationError {
+    #[error("unknown relocation: {0}")]
+    UnknownRelocation(u32),
+    #[error("unimplemented relocation: {0:?}")]
+    UnimplementedRelocation(delf::KnownRelType),
+    #[error("unknown symbol number: {0}")]
+    UnknownSymbolNumber(u32),
+    #[error("undefined symbol: {0}")]
+    UndefinedSymbol(String),
 }
 
 #[derive(Debug)]
@@ -47,6 +61,14 @@ impl GetResult {
     }
 }
 
+impl Object {
+    pub fn sym_name(&self, index: u32) -> Result<String, RelocationError> {
+        self.file
+            .get_string(self.syms[index as usize].name)
+            .map_err(|_| RelocationError::UnknownSymbolNumber(index))
+    }
+}
+
 impl Process {
     pub fn new() -> Self {
         Self {
@@ -56,13 +78,47 @@ impl Process {
         }
     }
 
-    pub fn apply_relocations(&self) -> Result<(), std::convert::Infallible> {
+    pub fn lookup_symbol(&self, name: &str) -> Result<Option<(&Object, &delf::Sym)>, RelocationError> {
+        for obj in &self.objects {
+            for (i, sym) in obj.syms.iter().enumerate() {
+                if obj.sym_name(i as u32)? == name {
+                    return Ok(Some((obj, sym)))
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn apply_relocations(&self) -> Result<(), RelocationError> {
         for obj in self.objects.iter().rev() {
             println!("Applying relocations for {:?}", obj.path);
             match obj.file.read_rela_entries() {
                 Ok(rels) => {
                     for rel in rels {
                         println!("Found {:?}", rel);
+                        match rel.r#type {
+                            delf::RelType::Known(t) => match t {
+                                delf::KnownRelType::_64 => {
+                                    let name = obj.sym_name(rel.sym)?;
+                                    println!("Looking up {:?}", name);
+                                    let (lib, sym) = self.lookup_symbol(&name)?.ok_or(RelocationError::UndefinedSymbol(name))?;
+                                    println!("Found at {:?} in {:?}", sym.value, lib.path);
+                                    let offset = obj.base + rel.offset;
+                                    let value = sym.value + lib.base + rel.addend;
+                                    println!("Value: {:?}", value);
+
+                                    unsafe {
+                                        let ptr: *mut u64 = offset.as_mut_ptr();
+                                        println!("Applying reloc @ {:?}", ptr);
+                                        *ptr = value.0;
+                                    }
+                                }
+                                _ => return Err(RelocationError::UnimplementedRelocation(t)),
+                            },
+                            delf::RelType::Unknown(num) => {
+                                return Err(RelocationError::UnknownRelocation(num))
+                            }
+                        }
                     }
                 }
                 Err(e) => println!("Nevermind: {:?}", e),
@@ -190,12 +246,15 @@ impl Process {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let syms = file.read_syms()?;
+
         let object = Object {
             path: path.clone(),
             base,
             segments,
             mem_range,
             file,
+            syms,
         };
 
         if path.to_str().unwrap().ends_with("libmsg.so") {
@@ -245,6 +304,9 @@ pub struct Object {
     pub mem_range: Range<delf::Addr>,
 
     pub segments: Vec<Segment>,
+
+    #[debug(skip)]
+    pub syms: Vec<delf::Sym>,
 }
 
 use std::{
