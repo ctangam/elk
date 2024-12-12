@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -21,15 +22,67 @@ pub enum LoadError {
 pub struct Process {
     pub objects: Vec<Object>,
 
+    pub objects_by_path: HashMap<PathBuf, usize>,
+
     pub search_path: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub enum GetResult {
+    Cached(usize),
+    Fresh(usize),
+}
+
+impl GetResult {
+    fn fresh(self) -> Option<usize> {
+        if let Self::Fresh(index) = self {
+            Some(index)
+        } else {
+            None
+        }
+    }
 }
 
 impl Process {
     pub fn new() -> Self {
         Self {
             objects: Vec::new(),
-            search_path: Vec::new(),
+            objects_by_path: HashMap::new(),
+            search_path: vec!["/usr/lib/x86_64-linux-gnu/".into()],
         }
+    }
+
+    pub fn load_object_and_dependencies<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+    ) -> Result<usize, LoadError> {
+        let index = self.load_object(path)?;
+
+        let mut a = vec![index];
+        while !a.is_empty() {
+            use delf::DynamicTag::Needed;
+            a = a
+                .into_iter()
+                .map(|index| &self.objects[index].file)
+                .flat_map(|file| file.dynamic_entry_strings(Needed))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|dep| self.get_object(&dep))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter_map(GetResult::fresh)
+                .collect();
+        }
+
+        Ok(index)
+    }
+
+    pub fn get_object(&mut self, name: &str) -> Result<GetResult, LoadError> {
+        let path = self.object_path(name)?;
+        self.objects_by_path
+            .get(&path)
+            .map(|&index| Ok(GetResult::Cached(index)))
+            .unwrap_or_else(|| self.load_object(path).map(GetResult::Fresh))
     }
 
     pub fn load_object<P: AsRef<Path>>(&mut self, path: P) -> Result<usize, LoadError> {
@@ -50,19 +103,22 @@ impl Process {
             .ok_or_else(|| LoadError::InvalidPath(path.clone()))?;
         self.search_path.extend(
             file.dynamic_entry_strings(delf::DynamicTag::RPath)
-                .map(|path| path.replace("$ORIGIN", &origin))
+                .map(|path| path.replace("$ORIGIN", origin))
                 .inspect(|path| println!("Found RPATH entry {:?}", path))
                 .map(PathBuf::from),
         );
 
         let object = Object {
-            path,
+            path: path.clone(),
             base: delf::Addr(0x400000),
             maps: Vec::new(),
             file,
         };
+
         let index = self.objects.len();
         self.objects.push(object);
+        self.objects_by_path.insert(path, index);
+
         Ok(index)
     }
 

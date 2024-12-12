@@ -10,14 +10,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input_path = env::args().nth(1).expect("usage: elk FILE");
 
     let mut proc = process::Process::new();
-    let exec = proc.load_object(input_path)?;
-    let dependencies: Vec<_> = proc.objects[exec]
-        .file
-        .dynamic_entry_strings(delf::DynamicTag::Needed)
-        .collect();
-    for dep in dependencies {
-        proc.load_object(proc.object_path(&dep)?)?;
-    }
+    proc.load_object_and_dependencies(input_path)?;
     println!("{:#?}", proc);
 
     Ok(())
