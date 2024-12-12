@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mmap::MemoryMap;
+use mmap::{MapOption, MemoryMap};
 
 #[derive(thiserror::Error, Debug)]
 pub enum LoadError {
@@ -16,6 +16,10 @@ pub enum LoadError {
     IO(PathBuf, std::io::Error),
     #[error("ELF object could not be parsed: {0}")]
     ParseError(PathBuf),
+    #[error("ELF object has no load segments")]
+    NoLoadSegments,
+    #[error("ELF object could not be mapped in memory: {0}")]
+    MapError(#[from] mmap::MapError),
 }
 
 #[derive(Debug)]
@@ -50,6 +54,22 @@ impl Process {
             objects_by_path: HashMap::new(),
             search_path: vec!["/usr/lib/x86_64-linux-gnu/".into()],
         }
+    }
+
+    pub fn apply_relocations(&self) -> Result<(), std::convert::Infallible> {
+        for obj in self.objects.iter().rev() {
+            println!("Applying relocations for {:?}", obj.path);
+            match obj.file.read_rela_entries() {
+                Ok(rels) => {
+                    for rel in rels {
+                        println!("Found {:?}", rel);
+                    }
+                }
+                Err(e) => println!("Nevermind: {:?}", e),
+            }
+        }
+
+        Ok(())
     }
 
     pub fn load_object_and_dependencies<P: AsRef<Path>>(
@@ -90,8 +110,13 @@ impl Process {
             .as_ref()
             .canonicalize()
             .map_err(|e| LoadError::IO(path.as_ref().to_path_buf(), e))?;
-        let input = fs::read(&path).map_err(|e| LoadError::IO(path.clone(), e))?;
 
+        use std::io::Read;
+        let mut fs_file = std::fs::File::open(&path).map_err(|e| LoadError::IO(path.clone(), e))?;
+        let mut input = Vec::new();
+        fs_file
+            .read_to_end(&mut input)
+            .map_err(|e| LoadError::IO(path.clone(), e))?;
         println!("Loading {:?}", path);
         let file = delf::File::parse_or_print_error(&input[..])
             .ok_or_else(|| LoadError::ParseError(path.clone()))?;
@@ -108,14 +133,79 @@ impl Process {
                 .map(PathBuf::from),
         );
 
+        let load_segments = || {
+            file.program_headers
+                .iter()
+                .filter(|ph| ph.r#type == delf::SegmentType::Load)
+        };
+
+        let mem_range = load_segments()
+            .map(|ph| ph.mem_range())
+            .fold(None, |acc, range| match acc {
+                None => Some(range),
+                Some(acc) => Some(convex_hull(acc, range)),
+            })
+            .ok_or(LoadError::NoLoadSegments)?;
+
+        let mem_size: usize = (mem_range.end - mem_range.start).into();
+        let mem_map = MemoryMap::new(mem_size, &[])?;
+        let base = delf::Addr(mem_map.data() as _) - mem_range.start;
+
+        let index = self.objects.len();
+
+        use std::os::unix::io::AsRawFd;
+        let segments = load_segments()
+            .filter_map(|ph| {
+                if ph.memsz.0 > 0 {
+                    let vaddr = delf::Addr(ph.vaddr.0 & !0xFFF);
+                    let padding = ph.vaddr - vaddr;
+                    let offset = ph.offset - padding;
+                    let memsz = ph.memsz + padding;
+                    println!("> {:#?}", ph);
+                    println!(
+                        "< file {:#?} | mem {:#?}",
+                        offset..(offset + memsz),
+                        vaddr..(vaddr + memsz)
+                    );
+                    let map_res = MemoryMap::new(
+                        memsz.into(),
+                        &[
+                            MapOption::MapReadable,
+                            MapOption::MapWritable,
+                            MapOption::MapFd(fs_file.as_raw_fd()),
+                            MapOption::MapOffset(offset.into()),
+                            MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
+                        ],
+                    );
+                    // this new - we store a Vec<Segment> now, and Segment structs
+                    // contain the padding we used, and the flags (for later mprotect-ing)
+                    Some(map_res.map(|map| Segment {
+                        map,
+                        padding,
+                        flags: ph.flags,
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let object = Object {
             path: path.clone(),
-            base: delf::Addr(0x400000),
-            maps: Vec::new(),
+            base,
+            segments,
+            mem_range,
             file,
         };
 
-        let index = self.objects.len();
+        if path.to_str().unwrap().ends_with("libmsg.so") {
+            let msg_addr: *const u8 = unsafe { (base + delf::Addr(0x2000)).as_ptr() };
+            dbg!(msg_addr);
+            let msg_slice = unsafe { std::slice::from_raw_parts(msg_addr, 0x26) };
+            let msg = std::str::from_utf8(msg_slice).unwrap();
+            dbg!(msg);
+        }
+
         self.objects.push(object);
         self.objects_by_path.insert(path, index);
 
@@ -132,6 +222,15 @@ impl Process {
 }
 
 use custom_debug_derive::Debug as CustomDebug;
+use enumflags2::BitFlags;
+
+#[derive(CustomDebug)]
+pub struct Segment {
+    #[debug(skip)]
+    pub map: MemoryMap,
+    pub padding: delf::Addr,
+    pub flags: BitFlags<delf::SegmentFlag>,
+}
 
 #[derive(CustomDebug)]
 pub struct Object {
@@ -143,9 +242,16 @@ pub struct Object {
     #[debug(skip)]
     pub file: delf::File,
 
-    // `MemoryMap` does not implement `Debug`, so we need to skip it.
-    // if we weren't using `custom_debug_derive`, we would have to do an
-    // entirely custom `fmt::Debug` implementation for `Object`!
-    #[debug(skip)]
-    pub maps: Vec<MemoryMap>,
+    pub mem_range: Range<delf::Addr>,
+
+    pub segments: Vec<Segment>,
+}
+
+use std::{
+    cmp::{max, min},
+    ops::Range,
+};
+
+fn convex_hull(a: Range<delf::Addr>, b: Range<delf::Addr>) -> Range<delf::Addr> {
+    (min(a.start, b.start))..(max(a.end, b.end))
 }

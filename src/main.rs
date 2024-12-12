@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut proc = process::Process::new();
     proc.load_object_and_dependencies(input_path)?;
-    println!("{:#?}", proc);
+    proc.apply_relocations()?;
 
     Ok(())
 }
