@@ -78,11 +78,42 @@ impl Process {
         }
     }
 
-    pub fn lookup_symbol(&self, name: &str) -> Result<Option<(&Object, &delf::Sym)>, RelocationError> {
+    pub fn adjust_protections(&self) -> Result<(), region::Error> {
+        use region::{protect, Protection};
+
         for obj in &self.objects {
+            for seg in &obj.segments {
+                let mut protection = Protection::NONE;
+                for flag in seg.flags.iter() {
+                    protection |= match flag {
+                        delf::SegmentFlag::Read => Protection::READ,
+                        delf::SegmentFlag::Write => Protection::WRITE,
+                        delf::SegmentFlag::Execute => Protection::EXECUTE,
+                    }
+                }
+                unsafe {
+                    protect(seg.map.data(), seg.map.len(), protection)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn lookup_symbol(
+        &self,
+        name: &str,
+        ignore: Option<&Object>,
+    ) -> Result<Option<(&Object, &delf::Sym)>, RelocationError> {
+        for obj in &self.objects {
+            if let Some(ignored) = ignore {
+                if std::ptr::eq(ignored, obj) {
+                    continue;
+                }
+            }
+
             for (i, sym) in obj.syms.iter().enumerate() {
                 if obj.sym_name(i as u32)? == name {
-                    return Ok(Some((obj, sym)))
+                    return Ok(Some((obj, sym)));
                 }
             }
         }
@@ -101,7 +132,9 @@ impl Process {
                                 delf::KnownRelType::_64 => {
                                     let name = obj.sym_name(rel.sym)?;
                                     println!("Looking up {:?}", name);
-                                    let (lib, sym) = self.lookup_symbol(&name)?.ok_or(RelocationError::UndefinedSymbol(name))?;
+                                    let (lib, sym) = self
+                                        .lookup_symbol(&name, None)?
+                                        .ok_or(RelocationError::UndefinedSymbol(name))?;
                                     println!("Found at {:?} in {:?}", sym.value, lib.path);
                                     let offset = obj.base + rel.offset;
                                     let value = sym.value + lib.base + rel.addend;
@@ -113,6 +146,27 @@ impl Process {
                                         *ptr = value.0;
                                     }
                                 }
+                                delf::KnownRelType::Copy => {
+                                    let name = obj.sym_name(rel.sym)?;
+                                    let (lib, sym) = self.lookup_symbol(&name, Some(obj))?.ok_or_else(|| {
+                                        RelocationError::UndefinedSymbol(name.clone())
+                                    })?;
+                                    println!(
+                                        "Found {:?} at {:?} (size {:?}) in {:?}",
+                                        name, sym.value, sym.size, lib.path
+                                    );
+                                    unsafe {
+                                        let src = (sym.value + lib.base).as_ptr();
+                                        let dst = (rel.offset + obj.base).as_mut_ptr();
+                                        std::ptr::copy_nonoverlapping::<u8>(
+                                            src,
+                                            dst,
+                                            sym.size as usize,
+                                        );
+                                    }
+                                    println!("Copy: stub!");
+                                }
+
                                 _ => return Err(RelocationError::UnimplementedRelocation(t)),
                             },
                             delf::RelType::Unknown(num) => {
@@ -204,7 +258,7 @@ impl Process {
             .ok_or(LoadError::NoLoadSegments)?;
 
         let mem_size: usize = (mem_range.end - mem_range.start).into();
-        let mem_map = MemoryMap::new(mem_size, &[])?;
+        let mem_map = std::mem::ManuallyDrop::new(MemoryMap::new(mem_size, &[])?);
         let base = delf::Addr(mem_map.data() as _) - mem_range.start;
 
         let index = self.objects.len();
@@ -316,4 +370,16 @@ use std::{
 
 fn convex_hull(a: Range<delf::Addr>, b: Range<delf::Addr>) -> Range<delf::Addr> {
     (min(a.start, b.start))..(max(a.end, b.end))
+}
+
+fn dump_maps(msg: &str) {
+    use std::{fs, process};
+
+    println!("======== MEMORY MAPS: {}", msg);
+    fs::read_to_string(format!("/proc/{pid}/maps", pid = process::id()))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("hello-dl") || line.contains("libmsg.so"))
+        .for_each(|line| println!("{}", line));
+    println!("=============================");
 }
