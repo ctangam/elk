@@ -1,8 +1,5 @@
 use core::str;
-use std::{env, error::Error, fs, mem::transmute, ptr::copy_nonoverlapping};
-
-use mmap::{MapOption, MemoryMap};
-use region::{protect, Protection};
+use std::{env, error::Error};
 
 mod process;
 
@@ -21,7 +18,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn pause(reason: &str) -> Result<(), Box<dyn Error>> {
+fn _pause(reason: &str) -> Result<(), Box<dyn Error>> {
     println!("Press Enter to {}...", reason);
     {
         let mut s = String::new();
@@ -33,11 +30,11 @@ fn pause(reason: &str) -> Result<(), Box<dyn Error>> {
 /**
  * Truncates a usize value to the left-adjacent (low) 4KiB boundary.
  */
-fn align_lo(x: usize) -> usize {
+fn _align_lo(x: usize) -> usize {
     x & !0xFFF
 }
 
-fn ndisasm(code: &[u8], origin: delf::Addr) -> Result<(), Box<dyn Error>> {
+fn _ndisasm(code: &[u8], origin: delf::Addr) -> Result<(), Box<dyn Error>> {
     use std::{
         io::Write,
         process::{Command, Stdio},

@@ -13,7 +13,7 @@
 
 ; `msg` is a label - which makes sense, a label is just a name for
 ; a place in memory! we've seen the `db` syntax earlier, same here
-msg: db "hi there", 10
+msg: db "this is way longer than sixteen bytes", 10
 ; this here is a local label - it belongs to `msg` and can be referred
 ; using `msg.end`. This is how we compute the length of `msg`!
  .end:
