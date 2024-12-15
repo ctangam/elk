@@ -147,9 +147,10 @@ impl Process {
                                 }
                                 delf::KnownRelType::Copy => {
                                     let name = obj.sym_name(rel.sym)?;
-                                    let (lib, sym) = self.lookup_symbol(&name, Some(obj))?.ok_or_else(|| {
-                                        RelocationError::UndefinedSymbol(name.clone())
-                                    })?;
+                                    let (lib, sym) =
+                                        self.lookup_symbol(&name, Some(obj))?.ok_or_else(|| {
+                                            RelocationError::UndefinedSymbol(name.clone())
+                                        })?;
                                     println!(
                                         "Found {:?} at {:?} (size {:?}) in {:?}",
                                         name, sym.value, sym.size, lib.path
@@ -257,45 +258,53 @@ impl Process {
             .ok_or(LoadError::NoLoadSegments)?;
 
         let mem_size: usize = (mem_range.end - mem_range.start).into();
-        let mem_map = std::mem::ManuallyDrop::new(MemoryMap::new(mem_size, &[])?);
+        let mem_map = std::mem::ManuallyDrop::new(MemoryMap::new(
+            mem_size,
+            &[MapOption::MapReadable, MapOption::MapWritable],
+        )?);
         let base = delf::Addr(mem_map.data() as _) - mem_range.start;
 
         let index = self.objects.len();
 
         use std::os::unix::io::AsRawFd;
         let segments = load_segments()
-            .filter_map(|ph| {
-                if ph.memsz.0 > 0 {
-                    let vaddr = delf::Addr(ph.vaddr.0 & !0xFFF);
-                    let padding = ph.vaddr - vaddr;
-                    let offset = ph.offset - padding;
-                    let memsz = ph.memsz + padding;
-                    println!("> {:#?}", ph);
-                    println!(
-                        "< file {:#?} | mem {:#?}",
-                        offset..(offset + memsz),
-                        vaddr..(vaddr + memsz)
-                    );
-                    let map_res = MemoryMap::new(
-                        memsz.into(),
-                        &[
-                            MapOption::MapReadable,
-                            MapOption::MapWritable,
-                            MapOption::MapFd(fs_file.as_raw_fd()),
-                            MapOption::MapOffset(offset.into()),
-                            MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
-                        ],
-                    );
-                    // this new - we store a Vec<Segment> now, and Segment structs
-                    // contain the padding we used, and the flags (for later mprotect-ing)
-                    Some(map_res.map(|map| Segment {
-                        map,
-                        padding,
-                        flags: ph.flags,
-                    }))
-                } else {
-                    None
+            .filter(|ph| ph.memsz.0 > 0)
+            .map(|ph| -> Result<_, LoadError> {
+                let vaddr = delf::Addr(ph.vaddr.0 & !0xFFF);
+                let padding = ph.vaddr - vaddr;
+                let offset = ph.offset - padding;
+                let filesz = ph.filesz + padding;
+                let map = MemoryMap::new(
+                    filesz.into(),
+                    &[
+                        MapOption::MapReadable,
+                        MapOption::MapWritable,
+                        MapOption::MapFd(fs_file.as_raw_fd()),
+                        MapOption::MapOffset(offset.into()),
+                        MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
+                    ],
+                )?;
+                if ph.memsz > ph.filesz {
+                    // ...then we zero them!
+                    // note: this works because we already reserved the *convex hull*
+                    // of all segments in memory in our initial `MemoryMap::new` call,
+                    // so that memory is there.
+                    let mut zero_start = base + ph.mem_range().start + ph.filesz;
+                    let zero_len = ph.memsz - ph.filesz;
+                    unsafe {
+                        // this will probably get optimized to something good.
+                        for i in zero_start.as_mut_slice::<u8>(zero_len.into()) {
+                            *i = 0;
+                        }
+                    }
                 }
+                // this new - we store a Vec<Segment> now, and Segment structs
+                // contain the padding we used, and the flags (for later mprotect-ing)
+                Ok(Segment {
+                    map,
+                    padding,
+                    flags: ph.flags,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 

@@ -7,6 +7,7 @@
 
 _start:
         mov rdi, 1      ; stdout fd
+        xor rdx, rdx
         mov rsi, msg
         mov rdx, 38      ; 37 chars + newline
         mov rax, 1      ; write syscall
