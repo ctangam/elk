@@ -158,6 +158,7 @@ impl Process {
             RT::_64 => unsafe {
                 // we're using `set<T>()` and passing a `delf::Addr` - which is
                 // just a newtype over `u64`, so everything works out!
+                println!("_64: at {}, {:?} set to {}", objrel.addr(),  *objrel.addr().as_ptr::<u64>(),found.value() + addend);
                 objrel.addr().set(found.value() + addend);
             },
             RT::Relative => unsafe {
@@ -165,6 +166,7 @@ impl Process {
             },
             RT::Copy => unsafe {
                 // write() takes a &[u8], so `as_slice`'s type is inferred correctly.
+                println!("Copy: {} written to {:?} from {}", objrel.addr(), String::from_utf8_lossy(found.value().as_slice::<u8>(found.size())), found.value());
                 objrel.addr().write(found.value().as_slice(found.size()));
             },
             _ => return Err(RelocationError::UnimplementedRelocation(reltype)),
