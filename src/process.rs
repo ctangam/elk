@@ -21,14 +21,14 @@ pub enum LoadError {
     MapError(#[from] mmap::MapError),
     #[error("Could not read symbols from ELF object: {0}")]
     ReadSymsError(#[from] delf::ReadSymsError),
+    #[error("Could not read relocations from ELF object: {0}")]
+    ReadRelaError(#[from] delf::ReadRelaError),
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum RelocationError {
-    #[error("unknown relocation: {0}")]
-    UnknownRelocation(u32),
     #[error("unimplemented relocation: {0:?}")]
-    UnimplementedRelocation(delf::KnownRelType),
+    UnimplementedRelocation(delf::RelType),
     #[error("unknown symbol number: {0}")]
     UnknownSymbolNumber(u32),
     #[error("undefined symbol: {0}")]
@@ -57,14 +57,6 @@ impl GetResult {
         } else {
             None
         }
-    }
-}
-
-impl Object {
-    pub fn sym_name(&self, index: u32) -> Result<String, RelocationError> {
-        self.file
-            .get_string(self.syms[index as usize].name)
-            .map_err(|_| RelocationError::UnknownSymbolNumber(index))
     }
 }
 
@@ -98,87 +90,86 @@ impl Process {
         Ok(())
     }
 
-    pub fn lookup_symbol(
-        &self,
-        name: &str,
-        ignore: Option<&Object>,
-    ) -> Result<Option<(&Object, &delf::Sym)>, RelocationError> {
+    pub fn lookup_symbol(&self, wanted: &ObjectSym, ignore_self: bool) -> ResolvedSym {
         for obj in &self.objects {
-            if let Some(ignored) = ignore {
-                if std::ptr::eq(ignored, obj) {
-                    continue;
-                }
+            if ignore_self && std::ptr::eq(wanted.obj, obj) {
+                continue;
             }
 
-            for (i, sym) in obj.syms.iter().enumerate() {
-                if obj.sym_name(i as u32)? == name {
-                    return Ok(Some((obj, sym)));
+            if let Some(syms) = obj.sym_map.get_vec(&wanted.sym.name) {
+                if let Some(sym) = syms.iter().find(|sym| !sym.sym.shndx.is_undef()) {
+                    return ResolvedSym::Defined(ObjectSym { obj, sym });
                 }
             }
         }
-        Ok(None)
+        ResolvedSym::Undefined
     }
 
     pub fn apply_relocations(&self) -> Result<(), RelocationError> {
-        for obj in self.objects.iter().rev() {
-            println!("Applying relocations for {:?}", obj.path);
-            match obj.file.read_rela_entries() {
-                Ok(rels) => {
-                    for rel in rels {
-                        println!("Found {:?}", rel);
-                        match rel.r#type {
-                            delf::RelType::Known(t) => match t {
-                                delf::KnownRelType::_64 => {
-                                    let name = obj.sym_name(rel.sym)?;
-                                    println!("Looking up {:?}", name);
-                                    let (lib, sym) = self
-                                        .lookup_symbol(&name, None)?
-                                        .ok_or(RelocationError::UndefinedSymbol(name))?;
-                                    println!("Found at {:?} in {:?}", sym.value, lib.path);
-                                    let offset = obj.base + rel.offset;
-                                    let value = sym.value + lib.base + rel.addend;
-                                    println!("Value: {:?}", value);
+        let rels: Vec<_> = self
+            .objects
+            .iter()
+            .rev()
+            .map(|obj| obj.rels.iter().map(move |rel| ObjectRel { obj, rel }))
+            .flatten()
+            .collect();
 
-                                    unsafe {
-                                        let ptr: *mut u64 = offset.as_mut_ptr();
-                                        println!("Applying reloc @ {:?}", ptr);
-                                        *ptr = value.0;
-                                    }
-                                }
-                                delf::KnownRelType::Copy => {
-                                    let name = obj.sym_name(rel.sym)?;
-                                    let (lib, sym) =
-                                        self.lookup_symbol(&name, Some(obj))?.ok_or_else(|| {
-                                            RelocationError::UndefinedSymbol(name.clone())
-                                        })?;
-                                    println!(
-                                        "Found {:?} at {:?} (size {:?}) in {:?}",
-                                        name, sym.value, sym.size, lib.path
-                                    );
-                                    unsafe {
-                                        let src = (sym.value + lib.base).as_ptr();
-                                        let dst = (rel.offset + obj.base).as_mut_ptr();
-                                        std::ptr::copy_nonoverlapping::<u8>(
-                                            src,
-                                            dst,
-                                            sym.size as usize,
-                                        );
-                                    }
-                                    println!("Copy: stub!");
-                                }
-
-                                _ => return Err(RelocationError::UnimplementedRelocation(t)),
-                            },
-                            delf::RelType::Unknown(num) => {
-                                return Err(RelocationError::UnknownRelocation(num))
-                            }
-                        }
-                    }
-                }
-                Err(e) => println!("Nevermind: {:?}", e),
-            }
+        for rel in rels {
+            self.apply_relocation(rel)?;
         }
+        Ok(())
+    }
 
+    fn apply_relocation(&self, objrel: ObjectRel) -> Result<(), RelocationError> {
+        use delf::RelType as RT;
+
+        // destructure a bit, for convenience
+        let ObjectRel { obj, rel } = objrel;
+        let reltype = rel.r#type;
+        let addend = rel.addend;
+
+        // this is the symbol we're looking for.
+        // note that it may be symbol 0, which has an empty name - that's fine.
+        let wanted = ObjectSym {
+            obj,
+            sym: &obj.syms[rel.sym as usize],
+        };
+
+        // when doing a lookup, only ignore the relocation's object if
+        // we're performing a Copy relocation.
+        let ignore_self = matches!(reltype, RT::Copy);
+
+        // perform symbol lookup early
+        let found = match rel.sym {
+            // the relocation isn't bound to any symbol, go with undef
+            0 => ResolvedSym::Undefined,
+            _ => match self.lookup_symbol(&wanted, ignore_self) {
+                undef @ ResolvedSym::Undefined => match wanted.sym.sym.bind {
+                    // undefined symbols are fine if our local symbol is weak
+                    delf::SymBind::Weak => undef,
+                    // otherwise, error out now
+                    _ => return Err(RelocationError::UndefinedSymbol(format!("{:?}", wanted))),
+                },
+                // defined symbols are always fine
+                x => x,
+            },
+        };
+
+        match reltype {
+            RT::_64 => unsafe {
+                // we're using `set<T>()` and passing a `delf::Addr` - which is
+                // just a newtype over `u64`, so everything works out!
+                objrel.addr().set(found.value() + addend);
+            },
+            RT::Relative => unsafe {
+                objrel.addr().set(obj.base + addend);
+            },
+            RT::Copy => unsafe {
+                // write() takes a &[u8], so `as_slice`'s type is inferred correctly.
+                objrel.addr().write(found.value().as_slice(found.size()));
+            },
+            _ => return Err(RelocationError::UnimplementedRelocation(reltype)),
+        }
         Ok(())
     }
 
@@ -264,8 +255,6 @@ impl Process {
         )?);
         let base = delf::Addr(mem_map.data() as _) - mem_range.start;
 
-        let index = self.objects.len();
-
         use std::os::unix::io::AsRawFd;
         let segments = load_segments()
             .filter(|ph| ph.memsz.0 > 0)
@@ -309,6 +298,23 @@ impl Process {
             .collect::<Result<Vec<_>, _>>()?;
 
         let syms = file.read_syms()?;
+        let strtab = file
+            .get_dynamic_entry(delf::DynamicTag::StrTab)
+            .unwrap_or_else(|_| panic!("String table not found in {:?}", path));
+        let syms: Vec<_> = syms
+            .into_iter()
+            .map(|sym| unsafe {
+                let name = Name::from_addr(base + strtab + sym.name);
+                NamedSym { sym, name }
+            })
+            .collect();
+
+        let mut sym_map = MultiMap::new();
+        for sym in &syms {
+            sym_map.insert(sym.name.clone(), sym.clone())
+        }
+
+        let rels = file.read_rela_entries()?;
 
         let object = Object {
             path: path.clone(),
@@ -317,6 +323,8 @@ impl Process {
             mem_range,
             file,
             syms,
+            sym_map,
+            rels,
         };
 
         if path.to_str().unwrap().ends_with("libmsg.so") {
@@ -327,6 +335,7 @@ impl Process {
             dbg!(msg);
         }
 
+        let index = self.objects.len();
         self.objects.push(object);
         self.objects_by_path.insert(path, index);
 
@@ -344,6 +353,7 @@ impl Process {
 
 use custom_debug_derive::Debug as CustomDebug;
 use enumflags2::BitFlags;
+use multimap::MultiMap;
 
 #[derive(CustomDebug)]
 pub struct Segment {
@@ -351,6 +361,58 @@ pub struct Segment {
     pub map: MemoryMap,
     pub padding: delf::Addr,
     pub flags: BitFlags<delf::SegmentFlag>,
+}
+
+#[derive(Debug, Clone)]
+struct NamedSym {
+    sym: delf::Sym,
+    name: Name,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectSym<'a> {
+    obj: &'a Object,
+    sym: &'a NamedSym,
+}
+
+impl ObjectSym<'_> {
+    fn value(&self) -> delf::Addr {
+        self.obj.base + self.sym.sym.value
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedSym<'a> {
+    Defined(ObjectSym<'a>),
+    Undefined,
+}
+
+impl ResolvedSym<'_> {
+    fn value(&self) -> delf::Addr {
+        match self {
+            Self::Defined(sym) => sym.value(),
+            Self::Undefined => delf::Addr(0x0),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Self::Defined(sym) => sym.sym.sym.size as usize,
+            Self::Undefined => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ObjectRel<'a> {
+    obj: &'a Object,
+    rel: &'a delf::Rela,
+}
+
+impl ObjectRel<'_> {
+    fn addr(&self) -> delf::Addr {
+        self.obj.base + self.rel.offset
+    }
 }
 
 #[derive(CustomDebug)]
@@ -368,13 +430,21 @@ pub struct Object {
     pub segments: Vec<Segment>,
 
     #[debug(skip)]
-    pub syms: Vec<delf::Sym>,
+    pub syms: Vec<NamedSym>,
+
+    #[debug(skip)]
+    pub sym_map: MultiMap<Name, NamedSym>,
+
+    #[debug(skip)]
+    pub rels: Vec<delf::Rela>,
 }
 
 use std::{
     cmp::{max, min},
     ops::Range,
 };
+
+use crate::name::Name;
 
 fn convex_hull(a: Range<delf::Addr>, b: Range<delf::Addr>) -> Range<delf::Addr> {
     (min(a.start, b.start))..(max(a.end, b.end))
