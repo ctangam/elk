@@ -110,8 +110,7 @@ impl Process {
             .objects
             .iter()
             .rev()
-            .map(|obj| obj.rels.iter().map(move |rel| ObjectRel { obj, rel }))
-            .flatten()
+            .flat_map(|obj| obj.rels.iter().map(move |rel| ObjectRel { obj, rel }))
             .collect();
 
         for rel in rels {
