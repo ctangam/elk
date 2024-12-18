@@ -158,15 +158,30 @@ impl Process {
             RT::_64 => unsafe {
                 // we're using `set<T>()` and passing a `delf::Addr` - which is
                 // just a newtype over `u64`, so everything works out!
-                println!("_64: at {}, {:?} set to {}", objrel.addr(),  *objrel.addr().as_ptr::<u64>(),found.value() + addend);
+                println!(
+                    "_64: at {}, {:?} set to {}",
+                    objrel.addr(),
+                    *objrel.addr().as_ptr::<u64>(),
+                    found.value() + addend
+                );
                 objrel.addr().set(found.value() + addend);
             },
             RT::Relative => unsafe {
                 objrel.addr().set(obj.base + addend);
             },
+            RT::IRelative => unsafe {
+                let selector: extern "C" fn() -> delf::Addr =
+                    std::mem::transmute(obj.base + addend);
+                objrel.addr().set(selector());
+            },
             RT::Copy => unsafe {
                 // write() takes a &[u8], so `as_slice`'s type is inferred correctly.
-                println!("Copy: {} written to {:?} from {}", objrel.addr(), String::from_utf8_lossy(found.value().as_slice::<u8>(found.size())), found.value());
+                println!(
+                    "Copy: {} written to {:?} from {}",
+                    objrel.addr(),
+                    String::from_utf8_lossy(found.value().as_slice::<u8>(found.size())),
+                    found.value()
+                );
                 objrel.addr().write(found.value().as_slice(found.size()));
             },
             _ => return Err(RelocationError::UnimplementedRelocation(reltype)),
@@ -187,6 +202,7 @@ impl Process {
                 .into_iter()
                 .map(|index| &self.objects[index].file)
                 .flat_map(|file| file.dynamic_entry_strings(Needed))
+                .map(|s| String::from_utf8_lossy(s).to_string())
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|dep| self.get_object(&dep))
@@ -219,8 +235,10 @@ impl Process {
         fs_file
             .read_to_end(&mut input)
             .map_err(|e| LoadError::IO(path.clone(), e))?;
+
         println!("Loading {:?}", path);
-        let file = delf::File::parse_or_print_error(&input[..])
+
+        let file = delf::File::parse_or_print_error(input)
             .ok_or_else(|| LoadError::ParseError(path.clone()))?;
 
         let origin = path
@@ -230,6 +248,7 @@ impl Process {
             .ok_or_else(|| LoadError::InvalidPath(path.clone()))?;
         self.search_path.extend(
             file.dynamic_entry_strings(delf::DynamicTag::RPath)
+                .map(|path| String::from_utf8_lossy(path))
                 .map(|path| path.replace("$ORIGIN", origin))
                 .inspect(|path| println!("Found RPATH entry {:?}", path))
                 .map(PathBuf::from),
@@ -269,6 +288,7 @@ impl Process {
                     &[
                         MapOption::MapReadable,
                         MapOption::MapWritable,
+                        MapOption::MapExecutable,
                         MapOption::MapFd(fs_file.as_raw_fd()),
                         MapOption::MapOffset(offset.into()),
                         MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
@@ -298,24 +318,29 @@ impl Process {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let syms = file.read_syms()?;
-        let strtab = file
-            .get_dynamic_entry(delf::DynamicTag::StrTab)
-            .unwrap_or_else(|_| panic!("String table not found in {:?}", path));
-        let syms: Vec<_> = syms
-            .into_iter()
-            .map(|sym| unsafe {
-                let name = Name::from_addr(base + strtab + sym.name);
-                NamedSym { sym, name }
-            })
-            .collect();
+        let syms = file.read_dynsym_entries()?;
+        let syms: Vec<_> = if syms.is_empty() {
+            vec![]
+        } else {
+            let strtab = file
+                .get_dynamic_entry(delf::DynamicTag::StrTab)
+                .unwrap_or_else(|_| panic!("String table not found in {:?}", path));
+            syms.into_iter()
+                .map(|sym| unsafe {
+                    let name = Name::from_addr(base + strtab + sym.name);
+                    NamedSym { sym, name }
+                })
+                .collect()
+        };
 
         let mut sym_map = MultiMap::new();
         for sym in &syms {
             sym_map.insert(sym.name.clone(), sym.clone())
         }
 
-        let rels = file.read_rela_entries()?;
+        let mut rels = Vec::new();
+        rels.extend(file.read_rela_entries()?);
+        rels.extend(file.read_jmp_rel_entries()?);
 
         let object = Object {
             path: path.clone(),
@@ -424,7 +449,7 @@ pub struct Object {
 
     // we're skipping this one because it would get *real* verbose
     #[debug(skip)]
-    pub file: delf::File,
+    pub file: delf::File<Vec<u8>>,
 
     pub mem_range: Range<delf::Addr>,
 
