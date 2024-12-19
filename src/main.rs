@@ -266,8 +266,6 @@ fn cmd_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let exec_obj = &proc.objects[exec_index];
     let entry_point = exec_obj.file.entry_point + exec_obj.base;
     unsafe { jmp(entry_point.as_ptr()) };
-
-    Ok(())
 }
 
 fn _pause(reason: &str) -> Result<(), Box<dyn Error>> {
@@ -308,7 +306,8 @@ fn _ndisasm(code: &[u8], origin: delf::Addr) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-unsafe fn jmp(addr: *const u8) {
-    let fn_ptr: fn() = std::mem::transmute(addr);
-    fn_ptr();
+unsafe fn jmp(addr: *const u8) -> ! {
+    type EntryPoint = unsafe extern "C" fn() -> !;
+    let entrypoint: EntryPoint = std::mem::transmute(addr);
+    entrypoint();
 }

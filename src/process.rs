@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use mmap::{MapOption, MemoryMap};
@@ -31,8 +32,8 @@ pub enum RelocationError {
     UnimplementedRelocation(delf::RelType),
     #[error("unknown symbol number: {0}")]
     UnknownSymbolNumber(u32),
-    #[error("undefined symbol: {0}")]
-    UndefinedSymbol(String),
+    #[error("undefined symbol: {0:?}")]
+    UndefinedSymbol(NamedSym),
 }
 
 #[derive(Debug)]
@@ -147,7 +148,7 @@ impl Process {
                     // undefined symbols are fine if our local symbol is weak
                     delf::SymBind::Weak => undef,
                     // otherwise, error out now
-                    _ => return Err(RelocationError::UndefinedSymbol(format!("{:?}", wanted))),
+                    _ => return Err(RelocationError::UndefinedSymbol(wanted.sym.clone())),
                 },
                 // defined symbols are always fine
                 x => x,
@@ -170,8 +171,8 @@ impl Process {
                 objrel.addr().set(obj.base + addend);
             },
             RT::IRelative => unsafe {
-                let selector: extern "C" fn() -> delf::Addr =
-                    std::mem::transmute(obj.base + addend);
+                type Selector = unsafe extern "C" fn() -> delf::Addr;
+                let selector: Selector = std::mem::transmute(obj.base + addend);
                 objrel.addr().set(selector());
             },
             RT::Copy => unsafe {
@@ -291,7 +292,7 @@ impl Process {
                         MapOption::MapExecutable,
                         MapOption::MapFd(fs_file.as_raw_fd()),
                         MapOption::MapOffset(offset.into()),
-                        MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
+                        MapOption::MapAddr((base + vaddr).as_ptr()),
                     ],
                 )?;
                 if ph.memsz > ph.filesz {
@@ -311,7 +312,8 @@ impl Process {
                 // this new - we store a Vec<Segment> now, and Segment structs
                 // contain the padding we used, and the flags (for later mprotect-ing)
                 Ok(Segment {
-                    map,
+                    map: Arc::new(map),
+                    vaddr_range: vaddr..(ph.vaddr + ph.memsz),
                     padding,
                     flags: ph.flags,
                 })
@@ -322,12 +324,22 @@ impl Process {
         let syms: Vec<_> = if syms.is_empty() {
             vec![]
         } else {
-            let strtab = file
+            let dynstr = file
                 .get_dynamic_entry(delf::DynamicTag::StrTab)
                 .unwrap_or_else(|_| panic!("String table not found in {:?}", path));
+            let segment = segments
+                .iter()
+                // and here's where `vaddr_range` comes in handy
+                .find(|seg| seg.vaddr_range.contains(&dynstr))
+                .unwrap_or_else(|| panic!("Segment not found for string table in {:#?}", path));
+
             syms.into_iter()
                 .map(|sym| unsafe {
-                    let name = Name::from_addr(base + strtab + sym.name);
+                    let name = Name::mapped(
+                        &segment.map,
+                        // a little bit of maths can't hurt
+                        (dynstr + sym.name - segment.vaddr_range.start).into(),
+                    );
                     NamedSym { sym, name }
                 })
                 .collect()
@@ -354,7 +366,7 @@ impl Process {
         };
 
         if path.to_str().unwrap().ends_with("libmsg.so") {
-            let msg_addr: *const u8 = unsafe { (base + delf::Addr(0x2000)).as_ptr() };
+            let msg_addr: *const u8 = (base + delf::Addr(0x2000)).as_ptr();
             dbg!(msg_addr);
             let msg_slice = unsafe { std::slice::from_raw_parts(msg_addr, 0x26) };
             let msg = std::str::from_utf8(msg_slice).unwrap();
@@ -384,13 +396,14 @@ use multimap::MultiMap;
 #[derive(CustomDebug)]
 pub struct Segment {
     #[debug(skip)]
-    pub map: MemoryMap,
+    pub map: Arc<MemoryMap>,
+    pub vaddr_range: Range<delf::Addr>,
     pub padding: delf::Addr,
     pub flags: BitFlags<delf::SegmentFlag>,
 }
 
-#[derive(Debug, Clone)]
-struct NamedSym {
+#[derive(Clone, Debug)]
+pub struct NamedSym {
     sym: delf::Sym,
     name: Name,
 }
