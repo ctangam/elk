@@ -28,8 +28,8 @@ pub enum LoadError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum RelocationError {
-    #[error("unimplemented relocation: {0:?}")]
-    UnimplementedRelocation(delf::RelType),
+    #[error("{0:?}: unimplemented relocation type {1:?}")]
+    UnimplementedRelocation(PathBuf, delf::RelType),
     #[error("unknown symbol number: {0}")]
     UnknownSymbolNumber(u32),
     #[error("undefined symbol: {0:?}")]
@@ -185,7 +185,21 @@ impl Process {
                 );
                 objrel.addr().write(found.value().as_slice(found.size()));
             },
-            _ => return Err(RelocationError::UnimplementedRelocation(reltype)),
+            RT::GlobDat => unsafe {
+                println!(
+                    "GlobDat: at {}, {:?} set to {}",
+                    objrel.addr(),
+                    *objrel.addr().as_ptr::<u64>(),
+                    found.value()
+                );
+                objrel.addr().set(found.value());
+            },
+            _ => {
+                return Err(RelocationError::UnimplementedRelocation(
+                    obj.path.clone(),
+                    reltype,
+                ))
+            }
         }
         Ok(())
     }
@@ -249,6 +263,7 @@ impl Process {
             .ok_or_else(|| LoadError::InvalidPath(path.clone()))?;
         self.search_path.extend(
             file.dynamic_entry_strings(delf::DynamicTag::RPath)
+                .chain(file.dynamic_entry_strings(delf::DynamicTag::RUNPATH))
                 .map(|path| String::from_utf8_lossy(path))
                 .map(|path| path.replace("$ORIGIN", origin))
                 .inspect(|path| println!("Found RPATH entry {:?}", path))
