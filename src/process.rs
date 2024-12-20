@@ -185,9 +185,9 @@ impl Process {
                 );
                 objrel.addr().write(found.value().as_slice(found.size()));
             },
-            RT::GlobDat => unsafe {
+            RT::GlobDat | RT::JumpSlot => unsafe {
                 println!(
-                    "GlobDat: at {}, {:?} set to {}",
+                    "{reltype:?}: at {}, {:?} set to {}",
                     objrel.addr(),
                     *objrel.addr().as_ptr::<u64>(),
                     found.value()
