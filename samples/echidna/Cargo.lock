@@ -3,5 +3,14 @@
 version = 4
 
 [[package]]
+name = "compiler_builtins"
+version = "0.1.139"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7925a77545f37a18e152a4aeaeb9a220309022067cafcfa2ecebe9ec55d36ccb"
+
+[[package]]
 name = "echidna"
 version = "0.1.0"
+dependencies = [
+ "compiler_builtins",
+]

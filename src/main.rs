@@ -1,5 +1,7 @@
+#![feature(asm)]
+
 use core::str;
-use std::{env, error::Error};
+use std::error::Error;
 
 mod name;
 mod process;
@@ -51,6 +53,10 @@ struct RunArgs {
     #[argh(positional)]
     /// the absolute path of an executable file to load and run
     exec_path: String,
+
+    #[argh(positional)]
+    /// arguments for the executable file
+    args: Vec<String>,
 }
 
 fn main() {
@@ -147,7 +153,7 @@ impl fmt::Debug for Size {
         const MIB: u64 = 1024 * KIB;
 
         let x = (self.0).0;
-        #[allow(overlapping_patterns)]
+        #[allow(overlapping_range_endpoints)]
         #[allow(clippy::clippy::match_overlapping_arm)]
         match x {
             0..=KIB => write!(f, "{} B", x),
@@ -256,16 +262,43 @@ fn cmd_dig(args: DigArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn cmd_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
+    // these are the usual steps
     let mut proc = process::Process::new();
-    // ...except we now take `exec_path` from the `args` argument instead of
-    // calling `std::env::args()` ourselves!
-    let exec_index = proc.load_object_and_dependencies(args.exec_path)?;
+    let exec_index = proc.load_object_and_dependencies(&args.exec_path)?;
     proc.apply_relocations()?;
     proc.adjust_protections()?;
 
-    let exec_obj = &proc.objects[exec_index];
-    let entry_point = exec_obj.file.entry_point + exec_obj.base;
-    unsafe { jmp(entry_point.as_ptr()) };
+    // we'll need those to handle C-style strings (null-terminated)
+    use std::ffi::CString;
+
+    let exec = &proc.objects[exec_index];
+    // the first argument is typically the path to the executable itself.
+    // that's not something `argh` gives us, so let's add it ourselves
+    let args = std::iter::once(CString::new(args.exec_path.as_bytes()).unwrap())
+        .chain(
+            args.args
+                .iter()
+                .map(|s| CString::new(s.as_bytes()).unwrap()),
+        )
+        .collect();
+
+    let opts = process::StartOptions {
+        exec,
+        args,
+        // on the stack, environment variables are null-terminated `K=V` strings.
+        // the Rust API gives us key-value pairs, so we need to build those strings
+        // ourselves
+        env: std::env::vars()
+            .map(|(k, v)| CString::new(format!("{}={}", k, v).as_bytes()).unwrap())
+            .collect(),
+        // right now we pass all *our* auxiliary vectors to the underlying process.
+        // note that some of those aren't quite correct - there's a `Base` auxiliary
+        // vector, for example, which is set to `elk`'s base address, not `echidna`'s!
+        auxv: process::Auxv::get_known(),
+    };
+    proc.start(&opts);
+
+    Ok(())
 }
 
 fn _pause(reason: &str) -> Result<(), Box<dyn Error>> {
@@ -306,8 +339,30 @@ fn _ndisasm(code: &[u8], origin: delf::Addr) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-unsafe fn jmp(addr: *const u8) -> ! {
-    type EntryPoint = unsafe extern "C" fn() -> !;
-    let entrypoint: EntryPoint = std::mem::transmute(addr);
-    entrypoint();
+#[allow(named_asm_labels)]
+#[inline(never)]
+unsafe fn jmp(entry_point: *const u8, stack_contents: *const u64, qword_count: usize) {
+    std::arch::asm!(
+        // allocate (qword_count * 8) bytes
+        "mov {tmp}, {qword_count}",
+        "sal {tmp}, 3",
+        "sub rsp, {tmp}",
+
+        "l1:",
+        // start at i = (n-1)
+        "sub {qword_count}, 1",
+        // copy qwords to the stack
+        "mov {tmp}, QWORD PTR [{stack_contents}+{qword_count}*8]",
+        "mov QWORD PTR [rsp+{qword_count}*8], {tmp}",
+        // loop if i isn't zero, break otherwise
+        "test {qword_count}, {qword_count}",
+        "jnz l1",
+
+        "jmp {entry_point}",
+
+        entry_point = in(reg) entry_point,
+        stack_contents = in(reg) stack_contents,
+        qword_count = in(reg) qword_count,
+        tmp = out(reg) _,
+    )
 }

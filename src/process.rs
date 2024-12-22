@@ -6,6 +6,134 @@ use std::{
 
 use mmap::{MapOption, MemoryMap};
 
+use std::ffi::CString;
+
+// This struct has a lifetime, because it takes a reference to an `Object` - so
+// it's only "valid" for as long as the `Object` itself lives.
+pub struct StartOptions<'a> {
+    pub exec: &'a Object,
+    pub args: Vec<CString>,
+    pub env: Vec<CString>,
+    pub auxv: Vec<Auxv>,
+}
+
+// associated functions.
+#[derive(Debug, Clone, Copy)]
+#[repr(u64)]
+pub enum AuxType {
+    /// End of vector
+    Null = 0,
+    /// Entry should be ignored
+    Ignore = 1,
+    /// File descriptor of program
+    ExecFd = 2,
+    /// Program headers for program
+    PHdr = 3,
+    /// Size of program header entry
+    PhEnt = 4,
+    /// Number of program headers
+    PhNum = 5,
+    /// System page size
+    PageSz = 6,
+    /// Base address of interpreter
+    Base = 7,
+    /// Flags
+    Flags = 8,
+    /// Entry point of program
+    Entry = 9,
+    /// Program is not ELF
+    NotElf = 10,
+    /// Real uid
+    Uid = 11,
+    /// Effective uid
+    EUid = 12,
+    /// Real gid
+    Gid = 13,
+    /// Effective gid
+    EGid = 14,
+    /// String identifying CPU for optimizations
+    Platform = 15,
+    /// Arch-dependent hints at CPU capabilities
+    HwCap = 16,
+    /// Frequency at which times() increments
+    ClkTck = 17,
+    /// Secure mode boolean
+    Secure = 23,
+    /// String identifying real platform, may differ from Platform
+    BasePlatform = 24,
+    /// Address of 16 random bytes
+    Random = 25,
+    // Extension of HwCap
+    HwCap2 = 26,
+    /// Filename of program
+    ExecFn = 31,
+
+    SysInfo = 32,
+    SysInfoEHdr = 33,
+}
+
+// Here's our "auxiliary vector" struct -
+// just two `u64` in a trench coat.
+pub struct Auxv {
+    typ: AuxType,
+    value: u64,
+}
+
+impl Auxv {
+    // A list of all the auxiliary types we know (and care) about
+    const KNOWN_TYPES: &'static [AuxType] = &[
+        AuxType::ExecFd,
+        AuxType::PHdr,
+        AuxType::PhEnt,
+        AuxType::PhNum,
+        AuxType::PageSz,
+        AuxType::Base,
+        AuxType::Flags,
+        AuxType::Entry,
+        AuxType::NotElf,
+        AuxType::Uid,
+        AuxType::EUid,
+        AuxType::Gid,
+        AuxType::EGid,
+        AuxType::Platform,
+        AuxType::HwCap,
+        AuxType::ClkTck,
+        AuxType::Secure,
+        AuxType::BasePlatform,
+        AuxType::Random,
+        AuxType::HwCap2,
+        AuxType::ExecFn,
+        AuxType::SysInfo,
+        AuxType::SysInfoEHdr,
+    ];
+
+    // this is a quick libc binding thrown together (so we don't
+    // have to pull in the `libc` crate).
+    pub fn get(typ: AuxType) -> Option<Self> {
+        extern "C" {
+            // from libc
+            fn getauxval(typ: u64) -> u64;
+        }
+
+        unsafe {
+            match getauxval(typ as u64) {
+                0 => None,
+                value => Some(Self { typ, value }),
+            }
+        }
+    }
+
+    // returns a list of all aux vectors passed to us
+    // *that we know about*.
+    pub fn get_known() -> Vec<Self> {
+        Self::KNOWN_TYPES
+            .iter()
+            .copied()
+            .filter_map(Self::get)
+            .collect()
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum LoadError {
     #[error("ELF object not found: {0}")]
@@ -62,6 +190,64 @@ impl GetResult {
 }
 
 impl Process {
+
+    pub fn start(&self, opts: &StartOptions) {
+        let exec = opts.exec;
+        let entry_point = exec.file.entry_point + exec.base;
+        let stack = Self::build_stack(opts);
+
+        unsafe { crate::jmp(entry_point.as_ptr(), stack.as_ptr(), stack.len()) };
+    }
+
+    fn build_stack(opts: &StartOptions) -> Vec<u64> {
+        let mut stack = Vec::new();
+
+        let null = 0_u64;
+
+        macro_rules! push {
+            ($x:expr) => {
+                stack.push($x as u64)
+            };
+        }
+
+        // note: everything is pushed in reverse order
+
+        // argc
+        push!(opts.args.len());
+
+        // argv
+        for v in &opts.args {
+            // `CString.as_ptr()` gives us the address of a memory
+            // location containing a null-terminated string.
+            // Note that we borrow `StartOptions`, so as long as it's
+            // still live by the time we jump to the entry point, we
+            // don't have to worry about it being freed too early.
+            push!(v.as_ptr());
+        }
+        push!(null);
+
+        // envp
+        for v in &opts.env {
+            push!(v.as_ptr());
+        }
+        push!(null);
+
+        // auxv
+        for v in &opts.auxv {
+            push!(v.typ);
+            push!(v.value);
+        }
+        push!(AuxType::Null);
+        push!(null);
+
+        // align stack to 16-byte boundary
+        if stack.len() % 2 == 1 {
+            stack.push(0);
+        }
+
+        stack
+    }
+
     pub fn new() -> Self {
         Self {
             objects: Vec::new(),
