@@ -4,6 +4,7 @@
 #![feature(naked_functions)]
 #![feature(generic_const_exprs)]
 #![allow(incomplete_features)]
+#![feature(thread_local)] 
 
 mod support;
 use support::*;
@@ -16,8 +17,31 @@ pub unsafe extern "C" fn _start() {
     naked_asm!("mov rdi, rsp", "call main");
 }
 
+#[thread_local]
+static mut FOO: u32 = 10;
+#[thread_local]
+static mut BAR: u32 = 100;
+
+#[inline(never)]
+fn blackbox(x: u32) {
+    println!(x as usize);
+}
+
+#[inline(never)]
+#[no_mangle]
+unsafe fn play_with_tls() {
+    blackbox(FOO);
+    blackbox(BAR);
+    FOO *= 3;
+    BAR *= 6;
+    blackbox(FOO);
+    blackbox(BAR);
+}
+
 #[no_mangle]
 pub unsafe fn main(stack_top: *const u8) {
+    play_with_tls();
+
     let argc = *(stack_top as *const u64);
     let argv = stack_top.add(8) as *const *const u8;
 
