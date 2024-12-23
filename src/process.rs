@@ -1,3 +1,4 @@
+use core::unimplemented;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -8,10 +9,17 @@ use mmap::{MapOption, MemoryMap};
 
 use std::ffi::CString;
 
+#[derive(Debug)]
+pub struct TLS {
+    offsets: HashMap<delf::Addr, delf::Addr>,
+    block: Vec<u8>,
+    tcb_addr: delf::Addr,
+}
+
 // This struct has a lifetime, because it takes a reference to an `Object` - so
 // it's only "valid" for as long as the `Object` itself lives.
-pub struct StartOptions<'a> {
-    pub exec: &'a Object,
+pub struct StartOptions {
+    pub exec_index: usize,
     pub args: Vec<CString>,
     pub env: Vec<CString>,
     pub auxv: Vec<Auxv>,
@@ -165,15 +173,6 @@ pub enum RelocationError {
 }
 
 #[derive(Debug)]
-pub struct Process {
-    pub objects: Vec<Object>,
-
-    pub objects_by_path: HashMap<PathBuf, usize>,
-
-    pub search_path: Vec<PathBuf>,
-}
-
-#[derive(Debug)]
 pub enum GetResult {
     Cached(usize),
     Fresh(usize),
@@ -189,96 +188,26 @@ impl GetResult {
     }
 }
 
-impl Process {
+pub struct Loader {
+    pub search_path: Vec<PathBuf>,
 
-    pub fn start(&self, opts: &StartOptions) {
-        let exec = opts.exec;
-        let entry_point = exec.file.entry_point + exec.base;
-        let stack = Self::build_stack(opts);
+    pub objects: Vec<Object>,
 
-        unsafe { crate::jmp(entry_point.as_ptr(), stack.as_ptr(), stack.len()) };
-    }
+    pub objects_by_path: HashMap<PathBuf, usize>,
+}
 
-    fn build_stack(opts: &StartOptions) -> Vec<u64> {
-        let mut stack = Vec::new();
+pub trait ProcessState {
+    fn loader(&self) -> &Loader;
+}
 
-        let null = 0_u64;
+#[derive(Debug)]
+pub struct Process<S: ProcessState> {
+    pub state: S,
+}
 
-        macro_rules! push {
-            ($x:expr) => {
-                stack.push($x as u64)
-            };
-        }
-
-        // note: everything is pushed in reverse order
-
-        // argc
-        push!(opts.args.len());
-
-        // argv
-        for v in &opts.args {
-            // `CString.as_ptr()` gives us the address of a memory
-            // location containing a null-terminated string.
-            // Note that we borrow `StartOptions`, so as long as it's
-            // still live by the time we jump to the entry point, we
-            // don't have to worry about it being freed too early.
-            push!(v.as_ptr());
-        }
-        push!(null);
-
-        // envp
-        for v in &opts.env {
-            push!(v.as_ptr());
-        }
-        push!(null);
-
-        // auxv
-        for v in &opts.auxv {
-            push!(v.typ);
-            push!(v.value);
-        }
-        push!(AuxType::Null);
-        push!(null);
-
-        // align stack to 16-byte boundary
-        if stack.len() % 2 == 1 {
-            stack.push(0);
-        }
-
-        stack
-    }
-
-    pub fn new() -> Self {
-        Self {
-            objects: Vec::new(),
-            objects_by_path: HashMap::new(),
-            search_path: vec!["/usr/lib/x86_64-linux-gnu/".into()],
-        }
-    }
-
-    pub fn adjust_protections(&self) -> Result<(), region::Error> {
-        use region::{protect, Protection};
-
-        for obj in &self.objects {
-            for seg in &obj.segments {
-                let mut protection = Protection::NONE;
-                for flag in seg.flags.iter() {
-                    protection |= match flag {
-                        delf::SegmentFlag::Read => Protection::READ,
-                        delf::SegmentFlag::Write => Protection::WRITE,
-                        delf::SegmentFlag::Execute => Protection::EXECUTE,
-                    }
-                }
-                unsafe {
-                    protect(seg.map.data(), seg.map.len(), protection)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
+impl<S: ProcessState> Process<S> {
     pub fn lookup_symbol(&self, wanted: &ObjectSym, ignore_self: bool) -> ResolvedSym {
-        for obj in &self.objects {
+        for obj in &self.state.loader().objects {
             if ignore_self && std::ptr::eq(wanted.obj, obj) {
                 continue;
             }
@@ -291,103 +220,29 @@ impl Process {
         }
         ResolvedSym::Undefined
     }
+}
 
-    pub fn apply_relocations(&self) -> Result<(), RelocationError> {
-        let rels: Vec<_> = self
-            .objects
-            .iter()
-            .rev()
-            .flat_map(|obj| obj.rels.iter().map(move |rel| ObjectRel { obj, rel }))
-            .collect();
+pub struct Loading {
+    pub loader: Loader,
+}
 
-        for rel in rels {
-            self.apply_relocation(rel)?;
-        }
-        Ok(())
+impl ProcessState for Loading {
+    fn loader(&self) -> &Loader {
+        &self.loader
     }
+}
 
-    fn apply_relocation(&self, objrel: ObjectRel) -> Result<(), RelocationError> {
-        use delf::RelType as RT;
-
-        // destructure a bit, for convenience
-        let ObjectRel { obj, rel } = objrel;
-        let reltype = rel.r#type;
-        let addend = rel.addend;
-
-        // this is the symbol we're looking for.
-        // note that it may be symbol 0, which has an empty name - that's fine.
-        let wanted = ObjectSym {
-            obj,
-            sym: &obj.syms[rel.sym as usize],
-        };
-
-        // when doing a lookup, only ignore the relocation's object if
-        // we're performing a Copy relocation.
-        let ignore_self = matches!(reltype, RT::Copy);
-
-        // perform symbol lookup early
-        let found = match rel.sym {
-            // the relocation isn't bound to any symbol, go with undef
-            0 => ResolvedSym::Undefined,
-            _ => match self.lookup_symbol(&wanted, ignore_self) {
-                undef @ ResolvedSym::Undefined => match wanted.sym.sym.bind {
-                    // undefined symbols are fine if our local symbol is weak
-                    delf::SymBind::Weak => undef,
-                    // otherwise, error out now
-                    _ => return Err(RelocationError::UndefinedSymbol(wanted.sym.clone())),
+impl Process<Loading> {
+    pub fn new() -> Self {
+        Self {
+            state: Loading {
+                loader: Loader {
+                    objects: Vec::new(),
+                    objects_by_path: HashMap::new(),
+                    search_path: vec!["/usr/lib/x86_64-linux-gnu".into()],
                 },
-                // defined symbols are always fine
-                x => x,
             },
-        };
-
-        match reltype {
-            RT::_64 => unsafe {
-                // we're using `set<T>()` and passing a `delf::Addr` - which is
-                // just a newtype over `u64`, so everything works out!
-                println!(
-                    "_64: at {}, {:?} set to {}",
-                    objrel.addr(),
-                    *objrel.addr().as_ptr::<u64>(),
-                    found.value() + addend
-                );
-                objrel.addr().set(found.value() + addend);
-            },
-            RT::Relative => unsafe {
-                objrel.addr().set(obj.base + addend);
-            },
-            RT::IRelative => unsafe {
-                type Selector = unsafe extern "C" fn() -> delf::Addr;
-                let selector: Selector = std::mem::transmute(obj.base + addend);
-                objrel.addr().set(selector());
-            },
-            RT::Copy => unsafe {
-                // write() takes a &[u8], so `as_slice`'s type is inferred correctly.
-                println!(
-                    "Copy: {} written to {:?} from {}",
-                    objrel.addr(),
-                    String::from_utf8_lossy(found.value().as_slice::<u8>(found.size())),
-                    found.value()
-                );
-                objrel.addr().write(found.value().as_slice(found.size()));
-            },
-            RT::GlobDat | RT::JumpSlot => unsafe {
-                println!(
-                    "{reltype:?}: at {}, {:?} set to {}",
-                    objrel.addr(),
-                    *objrel.addr().as_ptr::<u64>(),
-                    found.value()
-                );
-                objrel.addr().set(found.value());
-            },
-            _ => {
-                return Err(RelocationError::UnimplementedRelocation(
-                    obj.path.clone(),
-                    reltype,
-                ))
-            }
         }
-        Ok(())
     }
 
     pub fn load_object_and_dependencies<P: AsRef<Path>>(
@@ -401,7 +256,7 @@ impl Process {
             use delf::DynamicTag::Needed;
             a = a
                 .into_iter()
-                .map(|index| &self.objects[index].file)
+                .map(|index| &self.state.loader.objects[index].file)
                 .flat_map(|file| file.dynamic_entry_strings(Needed))
                 .map(|s| String::from_utf8_lossy(s).to_string())
                 .collect::<Vec<_>>()
@@ -418,7 +273,9 @@ impl Process {
 
     pub fn get_object(&mut self, name: &str) -> Result<GetResult, LoadError> {
         let path = self.object_path(name)?;
-        self.objects_by_path
+        self.state
+            .loader
+            .objects_by_path
             .get(&path)
             .map(|&index| Ok(GetResult::Cached(index)))
             .unwrap_or_else(|| self.load_object(path).map(GetResult::Fresh))
@@ -447,7 +304,7 @@ impl Process {
             .ok_or_else(|| LoadError::InvalidPath(path.clone()))?
             .to_str()
             .ok_or_else(|| LoadError::InvalidPath(path.clone()))?;
-        self.search_path.extend(
+        self.state.loader.search_path.extend(
             file.dynamic_entry_strings(delf::DynamicTag::RPath)
                 .chain(file.dynamic_entry_strings(delf::DynamicTag::RUNPATH))
                 .map(|path| String::from_utf8_lossy(path))
@@ -574,19 +431,362 @@ impl Process {
             dbg!(msg);
         }
 
-        let index = self.objects.len();
-        self.objects.push(object);
-        self.objects_by_path.insert(path, index);
+        let index = self.state.loader.objects.len();
+        self.state.loader.objects.push(object);
+        self.state.loader.objects_by_path.insert(path, index);
 
         Ok(index)
     }
 
     pub fn object_path(&self, name: &str) -> Result<PathBuf, LoadError> {
-        self.search_path
+        self.state
+            .loader
+            .search_path
             .iter()
             .filter_map(|prefix| prefix.join(name).canonicalize().ok())
             .find(|path| path.exists())
             .ok_or_else(|| LoadError::NotFound(name.into()))
+    }
+
+    pub fn allocate_tls(mut self) -> Process<TLSAllocated> {
+        let mut offsets = HashMap::new();
+        let mut storage_space = 0;
+        for obj in &mut self.state.loader.objects {
+            let needed = obj
+                .file
+                .segment_of_type(delf::SegmentType::TLS)
+                .map(|ph| ph.memsz.0)
+                .unwrap_or_default() as u64;
+
+            if needed > 0 {
+                let offset = delf::Addr(storage_space + needed);
+                offsets.insert(obj.base, offset);
+                storage_space += needed;
+            }
+        }
+
+        let storage_space = storage_space as usize;
+        let tcbhead_size = 704;
+        let total_size = storage_space + tcbhead_size;
+
+        // Allocate the whole capacity upfront so the vector doesn't
+        // get resized, and `tcb_addr` doesn't get invalidated
+        let mut block = Vec::with_capacity(total_size);
+        // This is what we'll be setting `%fs` to
+        let tcb_addr = delf::Addr(block.as_ptr() as u64 + storage_space as u64);
+        for _ in 0..storage_space {
+            // For now, zero out storage
+            block.push(0u8);
+        }
+
+        // Build a "somewhat fake" tcbhead structure
+        block.extend(&tcb_addr.0.to_le_bytes()); // tcb
+        block.extend(&0_u64.to_le_bytes()); // dtv
+        block.extend(&tcb_addr.0.to_le_bytes()); // thread pointer
+        block.extend(&0_u32.to_le_bytes()); // multiple_threads
+        block.extend(&0_u32.to_le_bytes()); // gscope_flag
+        block.extend(&0_u64.to_le_bytes()); // sysinfo
+        block.extend(&0xDEADBEEF_u64.to_le_bytes()); // stack guard
+        block.extend(&0xFEEDFACE_u64.to_le_bytes()); // pointer guard
+        while block.len() < block.capacity() {
+            // We don't care about the other fields, just pad out with zeros
+            block.push(0u8);
+        }
+
+        let tls = TLS {
+            offsets,
+            block,
+            tcb_addr,
+        };
+
+        Process {
+            state: TLSAllocated {
+                loader: self.state.loader,
+                tls,
+            },
+        }
+    }
+}
+
+pub struct TLSAllocated {
+    loader: Loader,
+    pub tls: TLS,
+}
+
+impl ProcessState for TLSAllocated {
+    fn loader(&self) -> &Loader {
+        &self.loader
+    }
+}
+
+impl Process<TLSAllocated> {
+    pub fn apply_relocations(self) -> Result<Process<Relocated>, RelocationError> {
+        let rels: Vec<_> = self
+            .state
+            .loader
+            .objects
+            .iter()
+            .rev()
+            .flat_map(|obj| obj.rels.iter().map(move |rel| ObjectRel { obj, rel }))
+            .collect();
+
+        for rel in rels {
+            self.apply_relocation(rel)?;
+        }
+
+        Ok(Process {
+            state: Relocated {
+                loader: self.state.loader,
+                tls: self.state.tls,
+            },
+        })
+    }
+
+    fn apply_relocation(&self, objrel: ObjectRel) -> Result<(), RelocationError> {
+        use delf::RelType as RT;
+
+        // destructure a bit, for convenience
+        let ObjectRel { obj, rel } = objrel;
+        let reltype = rel.r#type;
+        let addend = rel.addend;
+
+        // this is the symbol we're looking for.
+        // note that it may be symbol 0, which has an empty name - that's fine.
+        let wanted = ObjectSym {
+            obj,
+            sym: &obj.syms[rel.sym as usize],
+        };
+
+        // when doing a lookup, only ignore the relocation's object if
+        // we're performing a Copy relocation.
+        let ignore_self = matches!(reltype, RT::Copy);
+
+        // perform symbol lookup early
+        let found = match rel.sym {
+            // the relocation isn't bound to any symbol, go with undef
+            0 => ResolvedSym::Undefined,
+            _ => match self.lookup_symbol(&wanted, ignore_self) {
+                undef @ ResolvedSym::Undefined => match wanted.sym.sym.bind {
+                    // undefined symbols are fine if our local symbol is weak
+                    delf::SymBind::Weak => undef,
+                    // otherwise, error out now
+                    _ => return Err(RelocationError::UndefinedSymbol(wanted.sym.clone())),
+                },
+                // defined symbols are always fine
+                x => x,
+            },
+        };
+
+        match reltype {
+            RT::_64 => unsafe {
+                // we're using `set<T>()` and passing a `delf::Addr` - which is
+                // just a newtype over `u64`, so everything works out!
+                println!(
+                    "_64: at {}, {:?} set to {}",
+                    objrel.addr(),
+                    *objrel.addr().as_ptr::<u64>(),
+                    found.value() + addend
+                );
+                objrel.addr().set(found.value() + addend);
+            },
+            RT::Relative => unsafe {
+                objrel.addr().set(obj.base + addend);
+            },
+            RT::IRelative => unsafe {
+                type Selector = unsafe extern "C" fn() -> delf::Addr;
+                let selector: Selector = std::mem::transmute(obj.base + addend);
+                objrel.addr().set(selector());
+            },
+            RT::Copy => unsafe {
+                // write() takes a &[u8], so `as_slice`'s type is inferred correctly.
+                println!(
+                    "Copy: {} written to {:?} from {}",
+                    objrel.addr(),
+                    String::from_utf8_lossy(found.value().as_slice::<u8>(found.size())),
+                    found.value()
+                );
+                objrel.addr().write(found.value().as_slice(found.size()));
+            },
+            RT::GlobDat | RT::JumpSlot => unsafe {
+                println!(
+                    "{reltype:?}: at {}, {:?} set to {}",
+                    objrel.addr(),
+                    *objrel.addr().as_ptr::<u64>(),
+                    found.value()
+                );
+                objrel.addr().set(found.value());
+            },
+            RT::TPOff64 => unsafe {
+                if let ResolvedSym::Defined(sym) = found {
+                    let obj_offset = self
+                        .state
+                        .tls
+                        .offsets
+                        .get(&sym.obj.base)
+                        .unwrap_or_else(|| panic!("No thread-local storage allocated for object {:?}", sym.obj.file));
+                    let obj_offset = -(obj_offset.0 as i64);
+                    // sym sym sym hurray!
+                    let offset = obj_offset + sym.sym.sym.value.0 as i64 + objrel.rel.addend.0 as i64;
+                    objrel.addr().set(offset);
+                }
+            },
+            RT::DTPMOD64 => {}
+            _ => {
+                return Err(RelocationError::UnimplementedRelocation(
+                    obj.path.clone(),
+                    reltype,
+                ))
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct Relocated {
+    loader: Loader,
+    pub tls: TLS,
+}
+
+impl ProcessState for Relocated {
+    fn loader(&self) -> &Loader {
+        &self.loader
+    }
+}
+
+impl Process<Relocated> {
+    pub fn initialize_tls(self) -> Process<TLSInitialized> {
+        let tls = &self.state.tls;
+
+        for obj in &self.state.loader.objects {
+            if let Some(ph) = obj.file.segment_of_type(delf::SegmentType::TLS) {
+                if let Some(offset) = tls.offsets.get(&obj.base).cloned() {
+                    unsafe {
+                        (tls.tcb_addr - offset)
+                            .write((ph.vaddr + obj.base).as_slice(ph.filesz.into()));
+                    }
+                }
+            }
+        }
+
+        Process {
+            state: TLSInitialized {
+                loader: self.state.loader,
+                tls: self.state.tls,
+            },
+        }
+    }
+}
+
+pub struct TLSInitialized {
+    loader: Loader,
+    tls: TLS,
+}
+
+impl ProcessState for TLSInitialized {
+    fn loader(&self) -> &Loader {
+        &self.loader
+    }
+}
+
+impl Process<TLSInitialized> {
+    pub fn adjust_protections(self) -> Result<Process<Protected>, region::Error> {
+        use region::{protect, Protection};
+
+        for obj in &self.state.loader.objects {
+            for seg in &obj.segments {
+                let mut protection = Protection::NONE;
+                for flag in seg.flags.iter() {
+                    protection |= match flag {
+                        delf::SegmentFlag::Read => Protection::READ,
+                        delf::SegmentFlag::Write => Protection::WRITE,
+                        delf::SegmentFlag::Execute => Protection::EXECUTE,
+                    }
+                }
+                unsafe {
+                    protect(seg.map.data(), seg.map.len(), protection)?;
+                }
+            }
+        }
+
+        Ok(Process {
+            state: Protected {
+                loader: self.state.loader,
+                tls: self.state.tls,
+            },
+        })
+    }
+}
+
+pub struct Protected {
+    loader: Loader,
+    tls: TLS,
+}
+
+impl ProcessState for Protected {
+    fn loader(&self) -> &Loader {
+        &self.loader
+    }
+}
+
+impl Process<Protected> {
+    pub fn start(self, opts: &StartOptions) -> ! {
+        let exec = &self.state.loader.objects[opts.exec_index];
+        let entry_point = exec.file.entry_point + exec.base;
+        let stack = Self::build_stack(opts);
+
+        unsafe {
+            crate::set_fs(self.state.tls.tcb_addr.0);
+            crate::jmp(entry_point.as_ptr(), stack.as_ptr(), stack.len())
+        };
+    }
+
+    fn build_stack(opts: &StartOptions) -> Vec<u64> {
+        let mut stack = Vec::new();
+
+        let null = 0_u64;
+
+        macro_rules! push {
+            ($x:expr) => {
+                stack.push($x as u64)
+            };
+        }
+
+        // note: everything is pushed in reverse order
+
+        // argc
+        push!(opts.args.len());
+
+        // argv
+        for v in &opts.args {
+            // `CString.as_ptr()` gives us the address of a memory
+            // location containing a null-terminated string.
+            // Note that we borrow `StartOptions`, so as long as it's
+            // still live by the time we jump to the entry point, we
+            // don't have to worry about it being freed too early.
+            push!(v.as_ptr());
+        }
+        push!(null);
+
+        // envp
+        for v in &opts.env {
+            push!(v.as_ptr());
+        }
+        push!(null);
+
+        // auxv
+        for v in &opts.auxv {
+            push!(v.typ);
+            push!(v.value);
+        }
+        push!(AuxType::Null);
+        push!(null);
+
+        // align stack to 16-byte boundary
+        if stack.len() % 2 == 1 {
+            stack.push(0);
+        }
+
+        stack
     }
 }
 

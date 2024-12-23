@@ -1,6 +1,8 @@
 #include <unistd.h>
 #include <pthread.h>
 
+extern __thread int errno;
+
 void *in_thread(void *unused) {
     while (1) {
         sleep(1);
@@ -8,6 +10,7 @@ void *in_thread(void *unused) {
 }
 
 int main() {
+    printf("errno = %d\n", errno);
     pthread_t t1, t2;
     pthread_create(&t1, NULL, in_thread, NULL);
     pthread_create(&t2, NULL, in_thread, NULL);

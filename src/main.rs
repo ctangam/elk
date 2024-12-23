@@ -265,13 +265,16 @@ fn cmd_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     // these are the usual steps
     let mut proc = process::Process::new();
     let exec_index = proc.load_object_and_dependencies(&args.exec_path)?;
-    proc.apply_relocations()?;
-    proc.adjust_protections()?;
 
+    // each of these now returns a different type - we simply
+    // shadow the previous `proc` with it.
+    let proc = proc.allocate_tls();
+    let proc = proc.apply_relocations()?;
+    let proc = proc.initialize_tls();
+    let proc = proc.adjust_protections()?;
     // we'll need those to handle C-style strings (null-terminated)
     use std::ffi::CString;
 
-    let exec = &proc.objects[exec_index];
     // the first argument is typically the path to the executable itself.
     // that's not something `argh` gives us, so let's add it ourselves
     let args = std::iter::once(CString::new(args.exec_path.as_bytes()).unwrap())
@@ -283,7 +286,7 @@ fn cmd_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         .collect();
 
     let opts = process::StartOptions {
-        exec,
+        exec_index,
         args,
         // on the stack, environment variables are null-terminated `K=V` strings.
         // the Rust API gives us key-value pairs, so we need to build those strings
@@ -297,8 +300,6 @@ fn cmd_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         auxv: process::Auxv::get_known(),
     };
     proc.start(&opts);
-
-    Ok(())
 }
 
 fn _pause(reason: &str) -> Result<(), Box<dyn Error>> {
@@ -341,8 +342,9 @@ fn _ndisasm(code: &[u8], origin: delf::Addr) -> Result<(), Box<dyn Error>> {
 
 #[allow(named_asm_labels)]
 #[inline(never)]
-unsafe fn jmp(entry_point: *const u8, stack_contents: *const u64, qword_count: usize) {
-    std::arch::asm!(
+unsafe fn jmp(entry_point: *const u8, stack_contents: *const u64, qword_count: usize) -> ! {
+    use std::arch::asm;
+    asm!(
         // allocate (qword_count * 8) bytes
         "mov {tmp}, {qword_count}",
         "sal {tmp}, 3",
@@ -364,5 +366,22 @@ unsafe fn jmp(entry_point: *const u8, stack_contents: *const u64, qword_count: u
         stack_contents = in(reg) stack_contents,
         qword_count = in(reg) qword_count,
         tmp = out(reg) _,
+    );
+
+    asm!("ud2", options(noreturn));
+}
+
+#[inline(never)]
+unsafe fn set_fs(addr: u64) {
+    let syscall_number: u64 = 158;
+    let arch_set_fs: u64 = 0x1002;
+
+    use std::arch::asm;
+    asm!(
+        "syscall",
+        inout("rax") syscall_number => _,
+        in("rdi") arch_set_fs,
+        in("rsi") addr,
+        lateout("rcx") _, lateout("r11") _,
     )
 }
